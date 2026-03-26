@@ -1,0 +1,101 @@
+{
+  "baseline_11L_3x": {
+    "name": "baseline_11L_3x",
+    "params": 26501720,
+    "loss_first5": 16.01556224822998,
+    "loss_last5": 4.162325286865235,
+    "loss_drop": 11.853236961364745,
+    "min_loss": 4.018919467926025,
+    "artifact_mb": 13.77,
+    "ms_per_step": 108.3,
+    "total_time_s": 54.1
+  },
+  "+leaky_relu_sq": {
+    "name": "+leaky_relu_sq",
+    "params": 26501720,
+    "loss_first5": 15.961978721618653,
+    "loss_last5": 4.143357181549073,
+    "loss_drop": 11.81862154006958,
+    "min_loss": 3.9967708587646484,
+    "artifact_mb": 14.23,
+    "ms_per_step": 80.3,
+    "total_time_s": 40.1
+  },
+  "+smeargate": {
+    "name": "+smeargate",
+    "params": 26502232,
+    "loss_first5": 12.45800552368164,
+    "loss_last5": 4.21145076751709,
+    "loss_drop": 8.24655475616455,
+    "min_loss": 4.057642936706543,
+    "artifact_mb": 13.45,
+    "ms_per_step": 77.9,
+    "total_time_s": 39.0
+  },
+  "+bigram_hash": {
+    "name": "+bigram_hash",
+    "params": 26829401,
+    "loss_first5": 16.023309898376464,
+    "loss_last5": 4.112409591674805,
+    "loss_drop": 11.91090030670166,
+    "min_loss": 3.9013752937316895,
+    "artifact_mb": 14.66,
+    "ms_per_step": 79.9,
+    "total_time_s": 40.0
+  },
+  "+rope16": {
+    "name": "+rope16",
+    "params": 26501720,
+    "loss_first5": 16.04989585876465,
+    "loss_last5": 4.162296962738037,
+    "loss_drop": 11.887598896026613,
+    "min_loss": 4.027509689331055,
+    "artifact_mb": 13.58,
+    "ms_per_step": 80.8,
+    "total_time_s": 40.4
+  },
+  "+ln_scale": {
+    "name": "+ln_scale",
+    "params": 26501720,
+    "loss_first5": 16.302115058898927,
+    "loss_last5": 4.165958404541016,
+    "loss_drop": 12.136156654357912,
+    "min_loss": 3.987431764602661,
+    "artifact_mb": 13.81,
+    "ms_per_step": 77.2,
+    "total_time_s": 38.6
+  },
+  "+xsa4": {
+    "name": "+xsa4",
+    "params": 26501720,
+    "loss_first5": 16.022242546081543,
+    "loss_last5": 4.171817874908447,
+    "loss_drop": 11.850424671173096,
+    "min_loss": 4.018353462219238,
+    "artifact_mb": 13.86,
+    "ms_per_step": 80.2,
+    "total_time_s": 40.1
+  },
+  "+ve_9_10": {
+    "name": "+ve_9_10",
+    "params": 26665563,
+    "loss_first5": 16.030226135253905,
+    "loss_last5": 4.158452796936035,
+    "loss_drop": 11.871773338317869,
+    "min_loss": 4.021364212036133,
+    "artifact_mb": 14.1,
+    "ms_per_step": 219.4,
+    "total_time_s": 109.7
+  },
+  "FULL_SOTA": {
+    "name": "FULL_SOTA",
+    "params": 26993756,
+    "loss_first5": 12.661507987976075,
+    "loss_last5": 4.042669868469238,
+    "loss_drop": 8.618838119506837,
+    "min_loss": 3.837023973464966,
+    "artifact_mb": 14.52,
+    "ms_per_step": 250.3,
+    "total_time_s": 125.1
+  }
+}

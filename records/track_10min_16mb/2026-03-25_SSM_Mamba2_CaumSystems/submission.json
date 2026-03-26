@@ -1,0 +1,12 @@
+{
+    "name": "Andres Silva",
+    "github_id": "Blasmerit",
+    "organization": "CAUM Systems",
+    "val_bpb": null,
+    "architecture": "Mamba-2 SSM (10 layers, d_model=512, d_state=64, expand=2, headdim=64)",
+    "description": "First state-space model submission. Pure Mamba-2 SSD blocks — no attention. U-Net skip connections, Muon optimizer, int8+zlib quantization.",
+    "date": "2026-03-25",
+    "compute": "8xH100 SXM, 10min",
+    "seeds": [1337, 42, 2025],
+    "notes": "OpenAI requested SSM submissions. This explores whether Mamba-2 can compete with transformers in the parameter-constrained regime."
+}

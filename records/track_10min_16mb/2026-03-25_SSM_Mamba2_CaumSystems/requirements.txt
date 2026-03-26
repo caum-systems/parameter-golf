@@ -1,0 +1,10 @@
+numpy
+tqdm
+torch
+huggingface-hub
+setuptools
+typing-extensions==4.15.0
+datasets
+sentencepiece
+mamba-ssm>=2.3.0
+causal-conv1d>=1.4.0

@@ -1,0 +1,62 @@
+{
+  "rec_4x3_512_sota": {
+    "name": "rec_4x3_512_sota",
+    "params": 10307105,
+    "unique_blocks": 4,
+    "repeats": 3,
+    "effective_layers": 12,
+    "model_dim": 512,
+    "loss_first5": 11.833433914184571,
+    "loss_last5": 4.094445753097534,
+    "loss_drop": 7.738988161087037,
+    "min_loss": 3.7926297187805176,
+    "artifact_mb": 5.45,
+    "ms_per_step": 153.3
+  },
+  "rec_4x3_640_sota": {
+    "name": "rec_4x3_640_sota",
+    "params": 15767465,
+    "unique_blocks": 4,
+    "repeats": 3,
+    "effective_layers": 12,
+    "model_dim": 640,
+    "loss_first5": 13.042974090576172,
+    "loss_last5": 4.122663974761963,
+    "loss_drop": 8.920310115814209,
+    "min_loss": 3.9022555351257324,
+    "artifact_mb": 7.45,
+    "ms_per_step": 179.1
+  },
+  "rec_6x2_640_sota": {
+    "name": "rec_6x2_640_sota",
+    "params": 23145405,
+    "unique_blocks": 6,
+    "repeats": 2,
+    "effective_layers": 12,
+    "model_dim": 640,
+    "loss_first5": 13.045458602905274,
+    "loss_last5": 4.1065223693847654,
+    "loss_drop": 8.938936233520508,
+    "min_loss": 3.864595413208008,
+    "artifact_mb": 10.27,
+    "ms_per_step": 210.2
+  },
+  "rec_4x3_704_sota": {
+    "name": "rec_4x3_704_sota",
+    "error": "shape '[8, 256, 11, 64]' is invalid for input of size 1048576"
+  },
+  "rec_5x3_640_sota": {
+    "name": "rec_5x3_640_sota",
+    "params": 19458995,
+    "unique_blocks": 5,
+    "repeats": 3,
+    "effective_layers": 15,
+    "model_dim": 640,
+    "loss_first5": 12.686025524139405,
+    "loss_last5": 4.107095336914062,
+    "loss_drop": 8.578930187225343,
+    "min_loss": 3.8967530727386475,
+    "artifact_mb": 8.48,
+    "ms_per_step": 221.9
+  }
+}
