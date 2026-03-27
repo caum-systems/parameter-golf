@@ -24,7 +24,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FA3 = True
+except ImportError:
+    HAS_FA3 = False
+try:
+    import triton  # noqa: F401
+    CAN_COMPILE = True
+except ImportError:
+    CAN_COMPILE = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp16384")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -108,6 +117,10 @@ class Hyperparameters:
     inception_dim = int(os.environ.get("INCEPTION_DIM", 64))
     inception_layers = int(os.environ.get("INCEPTION_LAYERS", 1))
     svd_rank = int(os.environ.get("SVD_RANK", 64))
+    caum_swarm_enabled = bool(int(os.environ.get("CAUM_SWARM_ENABLED", "0")))
+    caum_swarm_voters = int(os.environ.get("CAUM_SWARM_VOTERS", 4))
+    caum_regime_temp_enabled = bool(int(os.environ.get("CAUM_REGIME_TEMP_ENABLED", "0")))
+    caum_lz76_enabled = bool(int(os.environ.get("CAUM_LZ76_ENABLED", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -672,7 +685,18 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        if HAS_FA3:
+            y = flash_attn_3_func(q, k, v, causal=True)
+        else:
+            # SDPA fallback: needs (B, H, T, D) and expanded KV heads
+            q_sdpa = q.transpose(1, 2)
+            k_sdpa = k.transpose(1, 2)
+            v_sdpa = v.transpose(1, 2)
+            if self.num_kv_heads < self.num_heads:
+                rep = self.num_heads // self.num_kv_heads
+                k_sdpa = k_sdpa.unsqueeze(2).expand(-1, -1, rep, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+                v_sdpa = v_sdpa.unsqueeze(2).expand(-1, -1, rep, -1, -1).reshape(bsz, self.num_heads, seqlen, self.head_dim)
+            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True).transpose(1, 2)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         if self.gated_attention:
@@ -937,18 +961,83 @@ class InceptionRefinementHead(nn.Module):
         refinement = self.proj_up(x)
         return hidden_states + self.scale * refinement
 
+@torch.no_grad()
+def fast_complexity_scores(input_ids: Tensor, window: int = 32) -> Tensor:
+    """Fast LZ76-inspired complexity: unique token ratio per sliding window.
+    Returns [B, T] in [0,1]. Low = repetitive, high = diverse. GPU-friendly."""
+    B, T = input_ids.shape
+    padded = F.pad(input_ids.long(), (window - 1, 0), value=-1)
+    windows = padded.unfold(1, window, 1)  # [B, T, window]
+    sorted_w, _ = windows.sort(dim=-1)
+    unique_counts = 1.0 + (sorted_w[:, :, 1:] != sorted_w[:, :, :-1]).float().sum(dim=-1)
+    return (unique_counts / window).clamp(0.0, 1.0)
+
+class RegimeAdaptiveTemperature(nn.Module):
+    """Adjusts softmax temperature based on local text complexity (CAUM-inspired).
+    Low complexity -> lower temp -> sharper. High complexity -> higher temp -> softer.
+    2 learned params. Starts with zero effect (scale init=0)."""
+    def __init__(self, base_temp: float = 1.0, temp_range: float = 0.3):
+        super().__init__()
+        self.base_temp = base_temp
+        self.temp_range = temp_range
+        self.scale = nn.Parameter(torch.tensor(0.0))
+        self.bias = nn.Parameter(torch.tensor(0.0))
+    def forward(self, logits: Tensor, complexity_flat: Tensor) -> Tensor:
+        """logits: [N, V], complexity_flat: [N]"""
+        effect = torch.sigmoid(self.scale) * self.temp_range
+        temp = self.base_temp + effect * (complexity_flat - 0.5) + self.bias * 0.1
+        temp = temp.clamp(min=0.5, max=2.0).unsqueeze(-1)
+        return logits / temp
+
+class SwarmVoting(nn.Module):
+    """Multiple lightweight voters predict next token, combined by confidence.
+    Each voter: unique bias + hidden scaling. Mixing: inverse-entropy weighting.
+    Inspired by CAUM's multi-signal fusion (UDS combines TCR, ESR, SCI signals)."""
+    def __init__(self, dim: int, vocab_size: int, num_voters: int = 4):
+        super().__init__()
+        self.num_voters = num_voters
+        self.voter_biases = nn.Parameter(torch.zeros(num_voters, vocab_size))
+        self.voter_scales = nn.Parameter(
+            torch.ones(num_voters, dim) + torch.randn(num_voters, dim) * 0.01)
+        self.confidence_temp = nn.Parameter(torch.tensor(1.0))
+    def forward(self, h_flat: Tensor, embedding_weight: Tensor,
+                trigram_bias: Tensor | None = None) -> Tensor:
+        """h_flat: [N, D], embedding_weight: [V, D]. Returns: log_probs [N, V]"""
+        all_log_probs = []
+        all_entropies = []
+        for k in range(self.num_voters):
+            h_k = h_flat * self.voter_scales[k].to(dtype=h_flat.dtype)
+            logits_k = F.linear(h_k, embedding_weight) + self.voter_biases[k].to(dtype=h_flat.dtype)
+            if trigram_bias is not None:
+                logits_k = logits_k + trigram_bias
+            log_probs_k = F.log_softmax(logits_k, dim=-1)
+            all_log_probs.append(log_probs_k)
+            probs_k = log_probs_k.exp()
+            entropy_k = -(probs_k * log_probs_k).sum(dim=-1)
+            all_entropies.append(entropy_k)
+        all_log_probs = torch.stack(all_log_probs, dim=0)  # [K, N, V]
+        all_entropies = torch.stack(all_entropies, dim=0)   # [K, N]
+        weights = F.softmax(-all_entropies * self.confidence_temp, dim=0)
+        log_weights = torch.log(weights.unsqueeze(-1) + 1e-8)
+        return torch.logsumexp(log_weights + all_log_probs, dim=0)
+
 class EnhancedOutputHead(nn.Module):
-    """Drop-in replacement combining Inception + TrigramHash + MoS for output computation."""
+    """Drop-in replacement combining Inception + TrigramHash + MoS + CAUM modules for output computation."""
     def __init__(self, dim: int, vocab_size: int, logit_softcap: float = 30.0,
                  mos_experts: int = 4, trigram_table_size: int = 4096,
                  trigram_proj_dim: int = 16, trigram_max_order: int = 4,
                  use_mos: bool = True, use_trigram: bool = True,
                  use_inception: bool = True, inception_dim: int = 64,
-                 inception_layers: int = 1):
+                 inception_layers: int = 1,
+                 use_swarm: bool = False, swarm_voters: int = 4,
+                 use_regime_temp: bool = False, use_lz76_feature: bool = False):
         super().__init__()
         self.use_mos = use_mos
         self.use_trigram = use_trigram
         self.use_inception = use_inception
+        self.use_swarm = use_swarm
+        self.use_regime_temp = use_regime_temp
+        self.use_lz76_feature = use_lz76_feature
         self.logit_softcap = logit_softcap
         self.vocab_size = vocab_size
         if use_inception:
@@ -957,12 +1046,27 @@ class EnhancedOutputHead(nn.Module):
         if use_trigram:
             self.trigram = TrigramLogitBias(vocab_size=vocab_size, proj_dim=trigram_proj_dim,
                 table_size=trigram_table_size, max_order=trigram_max_order)
-        if use_mos:
+        if use_mos and not use_swarm:  # swarm replaces mos when both enabled
             self.mos = MixtureOfSoftmaxes(dim=dim, vocab_size=vocab_size,
                 num_experts=mos_experts, logit_softcap=logit_softcap)
+        else:
+            self.use_mos = False
+        if use_swarm:
+            self.swarm = SwarmVoting(dim, vocab_size, num_voters=swarm_voters)
+        if use_regime_temp:
+            self.regime_temp = RegimeAdaptiveTemperature()
+        if use_lz76_feature:
+            self.lz76_proj = nn.Linear(1, dim, bias=False)
+            nn.init.zeros_(self.lz76_proj.weight)
 
     def forward(self, hidden: Tensor, input_ids: Tensor, targets: Tensor,
                 embedding_weight: Tensor) -> Tensor:
+        complexity = None
+        if self.use_regime_temp or self.use_lz76_feature:
+            complexity = fast_complexity_scores(input_ids)
+        if self.use_lz76_feature and complexity is not None:
+            lz_feat = self.lz76_proj(complexity.to(dtype=hidden.dtype).unsqueeze(-1))
+            hidden = hidden + lz_feat * 0.1
         if self.use_inception:
             hidden = self.inception(hidden)
         B, T, D = hidden.shape
@@ -971,19 +1075,30 @@ class EnhancedOutputHead(nn.Module):
         trigram_bias = None
         if self.use_trigram:
             trigram_bias = self.trigram(input_ids).reshape(-1, self.vocab_size)
-        if self.use_mos:
+        if self.use_swarm:
+            log_probs = self.swarm(h_flat, embedding_weight, trigram_bias)
+            return F.nll_loss(log_probs.float(), targets_flat, reduction='mean')
+        elif self.use_mos:
             log_probs = self.mos(h_flat, embedding_weight, trigram_bias)
             return F.nll_loss(log_probs.float(), targets_flat, reduction='mean')
         else:
             logits = F.linear(h_flat, embedding_weight)
             if trigram_bias is not None:
                 logits = logits + trigram_bias
+            if self.use_regime_temp and complexity is not None:
+                logits = self.regime_temp(logits, complexity.reshape(-1))
             if self.logit_softcap > 0:
                 logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             return F.cross_entropy(logits.float(), targets_flat, reduction='mean')
 
     def get_log_probs(self, hidden: Tensor, input_ids: Tensor,
                       embedding_weight: Tensor) -> Tensor:
+        complexity = None
+        if self.use_regime_temp or self.use_lz76_feature:
+            complexity = fast_complexity_scores(input_ids)
+        if self.use_lz76_feature and complexity is not None:
+            lz_feat = self.lz76_proj(complexity.to(dtype=hidden.dtype).unsqueeze(-1))
+            hidden = hidden + lz_feat * 0.1
         if self.use_inception:
             hidden = self.inception(hidden)
         B, T, D = hidden.shape
@@ -991,13 +1106,18 @@ class EnhancedOutputHead(nn.Module):
         trigram_bias = None
         if self.use_trigram:
             trigram_bias = self.trigram(input_ids).reshape(-1, self.vocab_size)
-        if self.use_mos:
+        if self.use_swarm:
+            log_probs = self.swarm(h_flat, embedding_weight, trigram_bias)
+            return log_probs.reshape(B, T, -1)
+        elif self.use_mos:
             log_probs = self.mos(h_flat, embedding_weight, trigram_bias)
             return log_probs.reshape(B, T, -1)
         else:
             logits = F.linear(h_flat, embedding_weight)
             if trigram_bias is not None:
                 logits = logits + trigram_bias
+            if self.use_regime_temp and complexity is not None:
+                logits = self.regime_temp(logits, complexity.reshape(-1))
             if self.logit_softcap > 0:
                 logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             return F.log_softmax(logits.float(), dim=-1).reshape(B, T, -1)
@@ -1039,6 +1159,10 @@ class GPT(nn.Module):
         inception_dim: int = 64,
         inception_layers: int = 1,
         svd_rank: int = 64,
+        caum_swarm_enabled: bool = False,
+        caum_swarm_voters: int = 4,
+        caum_regime_temp_enabled: bool = False,
+        caum_lz76_enabled: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -1115,6 +1239,8 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        _any_head = (mos_enabled or trigram_enabled or inception_enabled
+                     or caum_swarm_enabled or caum_regime_temp_enabled or caum_lz76_enabled)
         self.output_head = EnhancedOutputHead(
             dim=model_dim, vocab_size=vocab_size, logit_softcap=logit_softcap,
             mos_experts=mos_experts, trigram_table_size=trigram_table_size,
@@ -1122,7 +1248,9 @@ class GPT(nn.Module):
             use_mos=mos_enabled, use_trigram=trigram_enabled,
             use_inception=inception_enabled, inception_dim=inception_dim,
             inception_layers=inception_layers,
-        ) if (mos_enabled or trigram_enabled or inception_enabled) else None
+            use_swarm=caum_swarm_enabled, swarm_voters=caum_swarm_voters,
+            use_regime_temp=caum_regime_temp_enabled, use_lz76_feature=caum_lz76_enabled,
+        ) if _any_head else None
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings and not isinstance(self.tok_emb, SVDEmbedding):
@@ -1284,7 +1412,10 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    if CAN_COMPILE:
+        compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    else:
+        compiled_logits = base_model.forward_logits
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1662,10 +1793,16 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    if HAS_FA3:
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(True)
+        enable_mem_efficient_sdp(False)
+        enable_math_sdp(False)
+    else:
+        enable_cudnn_sdp(False)
+        enable_flash_sdp(False)
+        enable_mem_efficient_sdp(True)
+        enable_math_sdp(True)
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
@@ -1746,6 +1883,10 @@ def main() -> None:
         inception_dim=args.inception_dim,
         inception_layers=args.inception_layers,
         svd_rank=args.svd_rank,
+        caum_swarm_enabled=args.caum_swarm_enabled,
+        caum_swarm_voters=args.caum_swarm_voters,
+        caum_regime_temp_enabled=args.caum_regime_temp_enabled,
+        caum_lz76_enabled=args.caum_lz76_enabled,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1758,8 +1899,11 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model = compiled_model
+    if CAN_COMPILE:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        model = compiled_model
+    else:
+        model = base_model
 
     # Optimizer split:
     # - 4 parameter banks -> Muon (batched Newton-Schulz)
@@ -2096,6 +2240,14 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        mos_enabled=args.mos_enabled, mos_experts=args.mos_experts,
+        trigram_enabled=args.trigram_enabled, trigram_table_size=args.trigram_table_size,
+        trigram_proj_dim=args.trigram_proj_dim, trigram_max_order=args.trigram_max_order,
+        inception_enabled=args.inception_enabled, inception_dim=args.inception_dim,
+        inception_layers=args.inception_layers, svd_rank=args.svd_rank,
+        caum_swarm_enabled=args.caum_swarm_enabled, caum_swarm_voters=args.caum_swarm_voters,
+        caum_regime_temp_enabled=args.caum_regime_temp_enabled,
+        caum_lz76_enabled=args.caum_lz76_enabled,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
@@ -2106,7 +2258,10 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    if CAN_COMPILE:
+        compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_eval = eval_model
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
