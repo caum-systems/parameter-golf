@@ -34,6 +34,8 @@ try:
     CAN_COMPILE = True
 except ImportError:
     CAN_COMPILE = False
+if os.environ.get("DISABLE_COMPILE", "0") == "1":
+    CAN_COMPILE = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp16384")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
