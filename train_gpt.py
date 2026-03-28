@@ -1459,6 +1459,7 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
+    retokenize_if_needed(args, rank, world_size)
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
@@ -1927,5 +1928,50 @@ def main() -> None:
         log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
+def retokenize_if_needed(args, rank, world_size):
+    """Auto-retokenize sp1024 data to sp16384 if needed. Runs before training timer."""
+    from multiprocessing import Pool
+    dataset_dir = Path(args.data_path).resolve()
+    if dataset_dir.exists() and list(dataset_dir.glob("fineweb_train_*.bin")):
+        return  # Data already exists
+    src_dir = dataset_dir.parent / "fineweb10B_sp1024"
+    src_tok = Path(os.environ.get("SRC_TOKENIZER", "./data/tokenizers/fineweb_1024_bpe.model"))
+    if not src_dir.exists() or not src_tok.exists():
+        return  # No source data to retokenize from
+    if rank == 0:
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        src_shards = sorted(src_dir.glob("fineweb_*.bin"))
+        print(f"retokenize: {len(src_shards)} shards from {src_dir} -> {dataset_dir}")
+        def _retokenize_shard(shard_path_str):
+            shard_path = Path(shard_path_str)
+            out_path = dataset_dir / shard_path.name
+            if out_path.exists():
+                return f"  skip {shard_path.name}"
+            sp_old = spm.SentencePieceProcessor(model_file=str(src_tok))
+            sp_new = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+            header = np.fromfile(str(shard_path), dtype="<i4", count=256)
+            n = int(header[2])
+            old_tokens = np.fromfile(str(shard_path), dtype="<u2", count=n, offset=256*4)
+            chunk_size = 5000
+            new_tokens_list = []
+            for i in range(0, len(old_tokens), chunk_size):
+                text = sp_old.Decode(old_tokens[i:i+chunk_size].tolist())
+                new_tokens_list.extend(sp_new.Encode(text))
+            new_tokens = np.array(new_tokens_list, dtype=np.uint16)
+            new_header = np.zeros(256, dtype=np.int32)
+            new_header[0] = 20240520
+            new_header[1] = 1
+            new_header[2] = len(new_tokens)
+            with open(str(out_path), "wb") as f:
+                f.write(new_header.tobytes())
+                f.write(new_tokens.tobytes())
+            return f"  done {shard_path.name}: {n:,} -> {len(new_tokens):,} tokens"
+        t0 = time.time()
+        with Pool(min(len(src_shards), os.cpu_count() or 8)) as pool:
+            for msg in pool.imap_unordered(_retokenize_shard, [str(s) for s in src_shards]):
+                print(msg)
+        print(f"retokenize: completed in {time.time()-t0:.0f}s")
+    if world_size > 1:
+        dist.barrier()
 if __name__ == "__main__":
     main()
